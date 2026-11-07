@@ -11,9 +11,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, cast
 
 import asyncio
+import json
 
 from maibot_sdk import ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
@@ -40,9 +42,71 @@ from .runtime import QQEventRouter, QQRuntimeBuilder, QQRuntimeBundle
 from .services import QQActionService, QQQueryService
 
 
+# QZone payloads are returned as raw JSON; keep one response below this size so
+# a long feed cannot flood the planner context.
+QZONE_TEXT_LIMIT = 6000
+QZONE_DEFAULT_NUM = 10
+QZONE_MAX_NUM = 30
+QZONE_MAX_IMAGES_SHOWN = 4
+QZONE_IMAGE_URL_SHOWN = 120
+# get_qzone_feeds accepts at most 50 items per page; a filtered read wants the
+# widest window because the client cannot filter by account.
+QZONE_FILTER_FETCH_NUM = 50
+# QZone mixes ads and recommendations into the feed; appid 6600 has no tid and
+# is never a real post.
+QZONE_AD_APPIDS = frozenset({6600})
+
+# Never reachable, whatever the plugin config says: account credentials and
+# process control are not something a chat model may touch.
+_ONEBOT_BLOCKED_ACTIONS = frozenset({
+    "get_cookies",
+    "get_csrf_token",
+    "get_credentials",
+    "get_clientkey",
+    "get_rkey",
+    "get_rkey_server",
+    "nc_get_rkey",
+    "send_packet",
+    "nc_get_packet_status",
+    "bot_exit",
+    "set_restart",
+    "clean_cache",
+    "unknown_action",
+})
+
+# Irreversible or other-people-affecting actions, gated by onebot_api_allow_destructive.
+_ONEBOT_DESTRUCTIVE_ACTIONS = frozenset({
+    "set_group_kick",
+    "set_group_kick_members",
+    "set_group_ban",
+    "set_group_whole_ban",
+    "set_group_leave",
+    "set_group_admin",
+    "set_group_card",
+    "set_group_name",
+    "set_group_portrait",
+    "set_group_special_title",
+    "set_group_add_option",
+    "set_group_add_request",
+    "set_group_search",
+    "set_group_remark",
+    "set_group_todo",
+    "delete_essence_msg",
+    "delete_friend",
+    "set_qq_profile",
+    "set_qq_avatar",
+    "set_self_longnick",
+    "set_friend_remark",
+    "set_friend_add_request",
+    "send_like",
+    "set_online_status",
+    "set_diy_online_status",
+    "delete_msg",
+})
+
+
 def _matches_scoped_identifier(allowed_values: List[str], current_value: str) -> bool:
     """兼容 ``platform:id`` 与纯 ID 两种配置格式。"""
-
     normalized_current_value = str(current_value or "").strip()
     if not normalized_current_value:
         return False
@@ -244,6 +308,506 @@ class SnowLumaAdapterPlugin(
             "stream_id": str(open_session_result.get("session_id") or open_session_result.get("stream_id") or ""),
             "session": open_session_result.get("stream") or {},
             "message_id": message_id,
+        }
+
+    @Tool(
+        "onebot_api",
+        platforms="qq",
+        description=(
+            "调用常见 OneBot 动作，参数为 JSON 对象字符串。只用于下面这些已包装工具覆盖不到的动作：\n"
+            "查询：get_group_list 群列表；get_group_info {group_id} 群资料；get_group_member_list {group_id} 群成员；"
+            "get_group_member_info {group_id,user_id} 成员资料；get_group_detail_info {group_id}；"
+            "get_stranger_info {user_id}；get_friend_list 好友列表；get_recent_contact 最近会话；"
+            "get_login_info 自己的账号；get_status 登录状态。\n"
+            "历史：get_group_msg_history {group_id,count}；get_friend_msg_history {user_id,count}；"
+            "get_msg {message_id}；get_forward_msg {message_id}；get_essence_msg_list {group_id}；get_group_notice {group_id}。\n"
+            "群文件（只读）：get_group_root_files {group_id}；get_group_files_by_folder {group_id,folder_id}；"
+            "get_group_file_url {group_id,file_id}。\n"
+            "轻互动：group_poke {group_id,user_id}；send_group_sign {group_id}。\n"
+            "发消息、撤回、戳一戳、贴表情、转发、禁言、QQ 空间都有专门的工具，不要用这个重复造。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="action",
+                param_type=ToolParamType.STRING,
+                description="OneBot 动作名，例如 get_group_member_list。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="params_json",
+                param_type=ToolParamType.STRING,
+                description='JSON 对象字符串，例如 {"group_id": 1034166515}。',
+                required=False,
+            ),
+        ],
+        enabled=False,
+        visibility="deferred",
+    )
+    async def tool_onebot_api(
+        self,
+        action: str = "",
+        params_json: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Call a raw OneBot action through the adapter."""
+
+        del kwargs
+        action_name = str(action or "").strip()
+        if not action_name:
+            return {"success": False, "error": "action 不能为空"}
+        if action_name.lower().startswith("adapter.napcat."):
+            action_name = action_name[len("adapter.napcat."):].split(".", 1)[-1]
+
+        if action_name in _ONEBOT_BLOCKED_ACTIONS:
+            return {
+                "success": False,
+                "error": f"{action_name} 被永久禁用：涉及账号凭据或进程控制，任何配置都不会放开。",
+                "action": action_name,
+            }
+        if action_name in _ONEBOT_DESTRUCTIVE_ACTIONS and not self._load_settings().chat_abilities.onebot_api_allow_destructive:
+            return {
+                "success": False,
+                "error": (
+                    f"{action_name} 属于不可逆动作，需要先在插件配置里打开"
+                    "“允许不可逆 OneBot 动作”。日常聊天请用已包装的工具。"
+                ),
+                "action": action_name,
+            }
+
+        raw_params = str(params_json or "").strip()
+        if raw_params:
+            try:
+                params = json.loads(raw_params)
+            except ValueError as exc:
+                return {"success": False, "error": f"params_json 不是合法 JSON: {exc}"}
+        else:
+            params = {}
+        if not isinstance(params, dict):
+            return {"success": False, "error": "params_json 必须是 JSON 对象"}
+
+        try:
+            data = await self._call_napcat_action_data(action_name, params)
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "action": action_name}
+        return {"success": True, "action": action_name, "data": data}
+
+    @staticmethod
+    def _clamp_qzone_num(raw: Any) -> int:
+        """Keep the requested feed size inside a sane range."""
+
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return QZONE_DEFAULT_NUM
+        return max(1, min(value, QZONE_MAX_NUM))
+
+    @staticmethod
+    def _format_qzone_time(value: Any) -> str:
+        """Render the epoch seconds the client returns as local time."""
+
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError):
+            return str(value or "未知时间")
+
+    @staticmethod
+    def _qzone_images(item: Mapping[str, Any]) -> List[str]:
+        images = item.get("images")
+        if not isinstance(images, list):
+            return []
+        return [str(url).strip() for url in images if str(url).strip()]
+
+    @staticmethod
+    def _qzone_body(item: Mapping[str, Any]) -> str:
+        content = item.get("content")
+        text = str(content).strip() if content is not None else ""
+        if not text:
+            return "（无正文）"
+        if item.get("content_complete") is False:
+            return text + "…（正文被客户端截断）"
+        return text
+
+    @classmethod
+    def _qzone_image_text(cls, item: Mapping[str, Any]) -> str:
+        """Signed QZone image URLs are very long; keep a short readable hint."""
+
+        images = cls._qzone_images(item)
+        if not images:
+            return ""
+        shown = [
+            url if len(url) <= QZONE_IMAGE_URL_SHOWN else url[:QZONE_IMAGE_URL_SHOWN] + "…"
+            for url in images[:QZONE_MAX_IMAGES_SHOWN]
+        ]
+        more = f" 等 {len(images)} 张" if len(images) > len(shown) else ""
+        return "图片：" + " | ".join(shown) + more
+
+    @classmethod
+    def _render_feed_item(cls, item: Mapping[str, Any], index: int) -> str:
+        """One friend feed as two or three readable lines."""
+
+        lines = [
+            f"[{index}] {cls._format_qzone_time(item.get('time'))} · "
+            f"{item.get('nickname') or item.get('uin')}(QQ {item.get('uin')}) · tid={item.get('tid')}"
+        ]
+        lines.append(f"正文：{cls._qzone_body(item)}")
+        image_line = cls._qzone_image_text(item)
+        if image_line:
+            lines.append(image_line)
+        stats = []
+        if item.get("like_count") is not None:
+            stats.append(f"赞 {item.get('like_count')}")
+        if item.get("comment_count") is not None:
+            stats.append(f"评论 {item.get('comment_count')}")
+        if stats:
+            lines.append(" · ".join(stats))
+        return "\n".join(lines)
+
+    @classmethod
+    def _render_post_item(cls, item: Mapping[str, Any], index: int) -> str:
+        """One of our own posts; the client uses a different shape here."""
+
+        flags = []
+        if item.get("comment_num") is not None:
+            flags.append(f"评论 {item.get('comment_num')}")
+        if str(item.get("is_private")).lower() == "true":
+            flags.append("私密")
+        suffix = (" · " + " · ".join(flags)) if flags else ""
+        lines = [f"[{index}] {cls._format_qzone_time(item.get('time'))} · tid={item.get('tid')}{suffix}"]
+        lines.append(f"正文：{cls._qzone_body(item)}")
+        image_line = cls._qzone_image_text(item)
+        if image_line:
+            lines.append(image_line)
+        return "\n".join(lines)
+
+    async def _qzone_call(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Call a SnowLuma QZone action and return its raw payload."""
+
+        if not self._require_runtime_bundle().profile.supports_qzone:
+            return {
+                "success": False,
+                "error": "当前客户端不支持 QQ 空间动作（仅 SnowLuma 客户端支持）",
+                "action": action,
+            }
+        try:
+            data = await self._call_napcat_action_data(action, params)
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "action": action}
+        return {"success": True, "action": action, "data": data}
+
+    def _qzone_list_result(
+        self,
+        action_result: Dict[str, Any],
+        *,
+        kind: str,
+        qq: str = "",
+        limit: int = 0,
+    ) -> Dict[str, Any]:
+        """Turn a feed/post listing into compact text the planner can read.
+
+        The client ignores filter parameters, so ``qq`` is applied here: fetch a
+        wide window, then keep only that account's posts.
+        """
+
+        if not action_result.get("success"):
+            return action_result
+        data = action_result.get("data")
+        if not isinstance(data, Mapping):
+            return {
+                "success": False,
+                "error": f"{kind} 返回了无法识别的结构",
+                "action": action_result.get("action"),
+            }
+
+        if kind == "feeds":
+            raw_items = data.get("feeds")
+            items = [item for item in (raw_items or []) if isinstance(item, Mapping)]
+            # QZone mixes ads and recommendations into the feed; they carry no tid.
+            visible = [
+                item for item in items if item.get("tid") and item.get("appid") not in QZONE_AD_APPIDS
+            ]
+            skipped = len(items) - len(visible)
+            target = str(qq or "").strip()
+            if target:
+                visible = [item for item in visible if str(item.get("uin")) == target]
+                header = f"QQ {target} 最近 {min(len(visible), limit or len(visible))} 条动态"
+                if not visible:
+                    return {
+                        "success": True,
+                        "content": f"检查了最近 {len(items)} 条动态，没有来自 QQ {target} 的内容。",
+                        "count": 0,
+                    }
+            else:
+                header = f"共 {len(visible)} 条好友动态"
+            lines = [self._render_feed_item(item, index) for index, item in enumerate(visible, start=1)]
+        else:
+            raw_items = data.get("msglist")
+            items = [item for item in (raw_items or []) if isinstance(item, Mapping)]
+            visible = items
+            skipped = 0
+            lines = [self._render_post_item(item, index) for index, item in enumerate(visible, start=1)]
+            header = f"我共 {data.get('total', len(visible))} 条说说，本次返回 {len(visible)} 条"
+
+        if limit and len(visible) > limit:
+            visible = visible[:limit]
+            lines = lines[:limit]
+        if not visible:
+            return {"success": True, "content": header + "。", "count": 0}
+        footer_parts = []
+        if str(qq or "").strip():
+            footer_parts.append(f"共检查 {len(items)} 条动态")
+        if skipped:
+            footer_parts.append(f"已过滤 {skipped} 条广告/推荐")
+        footer = f"（{'，'.join(footer_parts)}）" if footer_parts else ""
+        content = header + footer + "\n\n" + "\n\n".join(lines)
+        if len(content) > QZONE_TEXT_LIMIT:
+            content = content[:QZONE_TEXT_LIMIT] + "\n…（已截断，可调小 num 只看最近几条）"
+        return {"success": True, "content": content, "count": len(visible), "skipped": skipped}
+
+    @Tool(
+        "qzone_feeds",
+        platforms="qq",
+        description=(
+            "查看 QQ 空间好友动态。返回每条的发布时间、作者、QQ 号、正文、图片地址、点赞和评论数，"
+            "以及 tid（给说说点赞、评论或删除时要用）。广告和推荐会被自动过滤。"
+            "只想知道某个人的动态时填 qq 参数，会只返回他/她的说说。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="num",
+                param_type=ToolParamType.INTEGER,
+                description="读取条数，默认 10，最多 30。",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="qq",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "可选：只返回这个 QQ 号的说说。号码可以用 get_qq_by_msg_id 从聊天里的消息查出来。"
+                ),
+                required=False,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_qzone_feeds(self, num: Any = 10, qq: Any = "", **kwargs: Any) -> Dict[str, Any]:
+        """Read friend feeds, optionally only one account's."""
+        del kwargs
+        num_value = self._clamp_qzone_num(num)
+        target = str(qq or "").strip()
+        # The client ignores filter parameters, so a filtered read needs a wider window.
+        fetch_num = QZONE_FILTER_FETCH_NUM if target else num_value
+        result = await self._qzone_call("get_qzone_feeds", {"num": fetch_num})
+        return self._qzone_list_result(result, kind="feeds", qq=target, limit=num_value)
+
+    @Tool(
+        "qzone_my_posts",
+        platforms="qq",
+        description=(
+            "查看自己（机器人账号）已经发过的 QQ 空间说说，含正文、图片地址、评论数和 tid。"
+            "想知道之前发过什么、或要删某条说说时用它。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="num",
+                param_type=ToolParamType.INTEGER,
+                description="读取条数，默认 10，最多 30。",
+                required=False,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_qzone_my_posts(self, num: Any = 10, **kwargs: Any) -> Dict[str, Any]:
+        """Read the account's own QZone posts."""
+        del kwargs
+        result = await self._qzone_call("get_qzone_msg_list", {"num": self._clamp_qzone_num(num)})
+        return self._qzone_list_result(result, kind="posts")
+
+    @Tool(
+        "qzone_post",
+        platforms="qq",
+        description=(
+            "发表一条 QQ 空间说说。这是公开内容，只有用户明确要求时才发，不要自己找话题发。"
+            "正文用大白话，不要长段落；图片只接受公网可访问的图片地址。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="content",
+                param_type=ToolParamType.STRING,
+                description="说说正文。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="images",
+                param_type=ToolParamType.ARRAY,
+                description="图片 URL 列表，可省略；建议不超过 9 张。",
+                required=False,
+                items_schema={"type": "string", "description": "公网可访问的图片地址"},
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_qzone_post(self, content: str = "", images: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """Publish a QZone post."""
+        del kwargs
+        text = str(content or "").strip()
+        if not text:
+            return {"success": False, "error": "说说正文不能为空"}
+        params: Dict[str, Any] = {"content": text}
+        image_list = [str(item).strip() for item in (images or []) if str(item).strip()]
+        if image_list:
+            params["images"] = image_list
+        result = await self._qzone_call("send_qzone_msg", params)
+        if not result.get("success"):
+            return result
+        data = result.get("data")
+        tid = data.get("tid") if isinstance(data, Mapping) else None
+        tail = f"，tid={tid}" if tid else ""
+        return {
+            "success": True,
+            "content": f"已发表说说{tail}。正文：{text[:80]}",
+            "tid": str(tid) if tid else "",
+            "post_data": data,
+        }
+
+    @Tool(
+        "qzone_delete_post",
+        platforms="qq",
+        description="删除自己 QQ 空间的一条说说；tid 从 qzone_my_posts 或 qzone_feeds 的结果里取。",
+        parameters=[
+            ToolParameterInfo(name="tid", param_type=ToolParamType.STRING, description="说说 tid。", required=True),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_qzone_delete_post(self, tid: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """Delete one of the account's own QZone posts."""
+        del kwargs
+        normalized = str(tid or "").strip()
+        if not normalized:
+            return {"success": False, "error": "缺少 tid"}
+        result = await self._qzone_call("delete_qzone_msg", {"tid": normalized})
+        if not result.get("success"):
+            return result
+        return {"success": True, "content": f"已删除说说 tid={normalized}。", "tid": normalized}
+
+    @Tool(
+        "qzone_like_post",
+        platforms="qq",
+        description=(
+            "给一条 QQ 空间说说点赞；把 unlike 设为 true 则取消点赞。"
+            "tid 和 qq 都从动态列表里取（列表里作者后面那个 QQ 号），省略 qq 会点到机器人自己的空间。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="tid", param_type=ToolParamType.STRING, description="说说 tid。", required=True),
+            ToolParameterInfo(
+                name="qq",
+                param_type=ToolParamType.STRING,
+                description="说说所属人的 QQ 号，即动态列表里的「QQ xxxxx」。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="unlike",
+                param_type=ToolParamType.BOOLEAN,
+                description="true 表示取消点赞，默认 false（点赞）。",
+                required=False,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_qzone_like_post(
+        self,
+        tid: str = "",
+        qq: str = "",
+        unlike: Any = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Like or unlike a QZone post."""
+        del kwargs
+        normalized = str(tid or "").strip()
+        target = str(qq or "").strip()
+        if not normalized or not target:
+            return {"success": False, "error": "tid 与 qq 都不能为空"}
+        if not target.isdigit():
+            return {"success": False, "error": f"qq 必须是纯数字 QQ 号，收到 {target!r}"}
+        is_unlike = bool(unlike)
+        action = "unlike_qzone" if is_unlike else "like_qzone"
+        result = await self._qzone_call(action, {"tid": normalized, "target_uin": int(target)})
+        if not result.get("success"):
+            return result
+        verb = "取消点赞" if is_unlike else "点赞"
+        return {
+            "success": True,
+            "content": f"已{verb} tid={normalized}（QQ {target}）。",
+            "tid": normalized,
+            "target_uin": target,
+            "unliked": is_unlike,
+        }
+
+    @Tool(
+        "qzone_comment_post",
+        platforms="qq",
+        description=(
+            "在一条 QQ 空间说说下评论。tid 和 qq 都从动态列表里取（列表里作者后面那个 QQ 号）；"
+            "省略 qq 会被当成评论机器人自己的空间，一定失败。"
+            "评论是公开内容，口吻跟聊天一致，别写成客套话。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="tid", param_type=ToolParamType.STRING, description="说说 tid。", required=True),
+            ToolParameterInfo(
+                name="qq",
+                param_type=ToolParamType.STRING,
+                description="说说所属人的 QQ 号，即动态列表里的「QQ xxxxx」。",
+                required=True,
+            ),
+            ToolParameterInfo(name="content", param_type=ToolParamType.STRING, description="评论正文。", required=True),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_qzone_comment_post(
+        self,
+        tid: str = "",
+        qq: str = "",
+        content: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Comment on a QZone post."""
+        del kwargs
+        normalized = str(tid or "").strip()
+        target = str(qq or "").strip()
+        text = str(content or "").strip()
+        if not normalized or not target or not text:
+            return {"success": False, "error": "tid、qq 与 content 都不能为空"}
+        if not target.isdigit():
+            return {"success": False, "error": f"qq 必须是纯数字 QQ 号，收到 {target!r}"}
+        result = await self._qzone_call(
+            "comment_qzone",
+            {"tid": normalized, "content": text, "target_uin": int(target)},
+        )
+        if not result.get("success"):
+            error = str(result.get("error") or "")
+            if "-10052" in error:
+                result["error"] = (
+                    f"{error}（这条说说可能已被删除，或 tid 与 qq 不匹配；"
+                    "用 qzone_feeds 重新读一遍拿最新的 tid 和 QQ 号）"
+                )
+            return result
+        data = result.get("data")
+        comment_id = ""
+        if isinstance(data, Mapping):
+            comment_id = str(data.get("comment_id") or data.get("id") or "")
+        tail = f"，评论 id={comment_id}" if comment_id else ""
+        return {
+            "success": True,
+            "content": f"已评论 tid={normalized}（QQ {target}）{tail}。内容：{text[:80]}",
+            "tid": normalized,
+            "target_uin": target,
+            "comment_id": comment_id,
+            "comment_data": data,
         }
 
     @Tool(
@@ -1037,6 +1601,13 @@ class SnowLumaAdapterPlugin(
             ("react_emoji", abilities.enable_emoji_like_tool),
             ("list_chat_streams", abilities.enable_forward_tool),
             ("forward_messages", abilities.enable_forward_tool),
+            ("qzone_feeds", abilities.enable_qzone_tools),
+            ("qzone_my_posts", abilities.enable_qzone_tools),
+            ("qzone_post", abilities.enable_qzone_tools),
+            ("qzone_delete_post", abilities.enable_qzone_tools),
+            ("qzone_like_post", abilities.enable_qzone_tools),
+            ("qzone_comment_post", abilities.enable_qzone_tools),
+            ("onebot_api", abilities.enable_onebot_api_tool),
         )
         try:
             for tool_name, enabled in tool_states:

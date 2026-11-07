@@ -86,7 +86,7 @@ class QQChatAbilitiesConfig(PluginConfigBase):
     __ui_order__: ClassVar[int] = 1
 
     enable_private_chat_tool: bool = Field(
-        default=False,
+        default=True,
         description="是否启用主动开启私聊工具。",
         json_schema_extra={
             "hint": "开启后，模型可向指定 QQ 用户发送首条私聊消息；请在宿主适配器策略中放行该私聊。",
@@ -107,7 +107,7 @@ class QQChatAbilitiesConfig(PluginConfigBase):
         },
     )
     enable_poke_tool: bool = Field(
-        default=False,
+        default=True,
         description="是否启用戳一戳工具。",
         json_schema_extra={
             "hint": "开启后，模型可向指定 QQ 用户发送戳一戳；群聊中戳当前群成员，私聊中发送好友戳一戳。",
@@ -128,7 +128,7 @@ class QQChatAbilitiesConfig(PluginConfigBase):
         },
     )
     enable_recall_tool: bool = Field(
-        default=False,
+        default=True,
         description="是否启用消息撤回工具。",
         json_schema_extra={
             "hint": "开启后，模型可撤回消息；撤回自己的消息限 2 分钟内，撤回他人消息需要机器人是群管理员。",
@@ -173,7 +173,7 @@ class QQChatAbilitiesConfig(PluginConfigBase):
         },
     )
     enable_emoji_like_tool: bool = Field(
-        default=False,
+        default=True,
         description="是否启用表情表态工具。",
         json_schema_extra={
             "hint": "开启后，模型可给消息贴表情回应（如赞、爱心）。",
@@ -188,7 +188,7 @@ class QQChatAbilitiesConfig(PluginConfigBase):
         },
     )
     enable_forward_tool: bool = Field(
-        default=False,
+        default=True,
         description="是否启用消息转发工具。",
         json_schema_extra={
             "hint": "开启后，模型可把一批消息打包成合并转发，发送到指定群或私聊。",
@@ -206,6 +206,72 @@ class QQChatAbilitiesConfig(PluginConfigBase):
             ),
             "label": "启用消息转发工具",
             "order": 5,
+        },
+    )
+    enable_qzone_tools: bool = Field(
+        default=True,
+        description="是否启用 QQ 空间工具。",
+        json_schema_extra={
+            "hint": "开启后模型可以读取好友动态和自己的说说、发说说、点赞与评论；仅 SnowLuma 客户端支持。",
+            "i18n": _schema_i18n(
+                label_en="Enable QZone tools",
+                label_ja="QZone ツールを有効化",
+                hint_en=(
+                    "Lets the model read friend feeds and its own posts, publish posts, "
+                    "and like or comment. Only available on the SnowLuma client."
+                ),
+                hint_ja=(
+                    "モデルが友達のフィードや自分の投稿を読み、投稿・いいね・コメントできます。"
+                    "SnowLuma クライアントでのみ利用できます。"
+                ),
+            ),
+            "label": "启用 QQ 空间工具",
+            "order": 6,
+        },
+    )
+    onebot_api_allow_destructive: bool = Field(
+        default=False,
+        description="是否允许通用 OneBot 工具执行不可逆动作。",
+        json_schema_extra={
+            "hint": "关闭时，踢人、禁言、退群、改群名片/群名、删好友、改资料、撤回他人消息等动作会被直接拒绝；"
+            "账号凭据类动作（取 cookie、令牌、协议发包）无论开关都永远禁用。",
+            "i18n": _schema_i18n(
+                label_en="Allow destructive OneBot actions",
+                label_ja="破壊的な OneBot アクションを許可",
+                hint_en=(
+                    "When off, kick/ban/leave/rename/delete-friend/profile edits and recalling "
+                    "other people's messages are rejected. Credential and packet-level actions "
+                    "are always blocked."
+                ),
+                hint_ja=(
+                    "オフのとき、キック・ミュート・退群・改名・友達削除・プロフィール変更・"
+                    "他人のメッセージ撤回は拒否されます。認証情報とパケット操作は常に拒否されます。"
+                ),
+            ),
+            "label": "允许不可逆 OneBot 动作",
+            "order": 7,
+        },
+    )
+    enable_onebot_api_tool: bool = Field(
+        default=False,
+        description="是否启用通用 OneBot 动作工具。",
+        json_schema_extra={
+            "hint": "高级开关：开启后模型可以调用常见 OneBot 查询与互动动作（群成员、群文件、历史消息等）。"
+            "不可逆动作由“允许不可逆 OneBot 动作”单独控制，凭据类动作永远禁用。",
+            "i18n": _schema_i18n(
+                label_en="Enable raw OneBot API tool",
+                label_ja="汎用 OneBot API ツールを有効化",
+                hint_en=(
+                    "Advanced switch: lets the model call arbitrary OneBot actions, including recall, mute and kick. "
+                    "Enable only when you trust the model."
+                ),
+                hint_ja=(
+                    "上級スイッチ：モデルが任意の OneBot アクション（撤回、ミュート、キックなど）を呼べます。"
+                    "信頼できる場合のみ有効にしてください。"
+                ),
+            ),
+            "label": "启用通用 OneBot 动作工具",
+            "order": 6,
         },
     )
 
